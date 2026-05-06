@@ -1,0 +1,2345 @@
+"""
+main.py
+-------
+Entry point for the PE80 gas distribution network hydraulic solver.
+
+Usage
+-----
+    python main.py --input PE80_Network_Template.xlsx
+    python main.py --input network.xlsx --output results.xlsx --verbose
+    python main.py --input network.xlsx --sg 0.62 --temp 20 --pressure 400
+
+Arguments
+---------
+    --input     Path to Excel input file (required)
+    --output    Path to write results  (default: same file, adds RESULTS sheet)
+    --sg        Gas specific gravity   (default: 0.62)
+    --temp      Flowing temperature    [°C]  (default: 20)
+    --pressure  Average network pressure [kPa(g)] for gas property calc (default: 300)
+    --tol       Solver tolerance [Sm³/s] (default: 1e-6)
+    --maxiter   Maximum iterations     (default: 100)
+    --map       Generate HTML pressure map (default: False)
+    --verbose   Print convergence table (default: True)
+"""
+
+import argparse
+import sys
+import os
+import pathlib
+import logging
+import shutil
+
+# ── Windows-safe UTF-8 output ────────────────────────────────────────────────
+# Prevents UnicodeEncodeError on Windows cmd/PowerShell (cp1252 default).
+# Tries three escalating strategies so it works on Python 3.7+ everywhere.
+import io as _io
+def _ensure_utf8(stream_name: str) -> None:
+    stream = getattr(sys, stream_name)
+    # Strategy 1: reconfigure()  (Python 3.7+, most environments)
+    if hasattr(stream, 'reconfigure'):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+            return
+        except Exception:
+            pass
+    # Strategy 2: wrap the underlying buffer
+    if hasattr(stream, 'buffer'):
+        try:
+            wrapped = _io.TextIOWrapper(
+                stream.buffer, encoding='utf-8',
+                errors='replace', line_buffering=True)
+            setattr(sys, stream_name, wrapped)
+            return
+        except Exception:
+            pass
+    # Strategy 3: give up gracefully — don't crash, just lose fancy chars
+
+for _s in ('stdout', 'stderr'):
+    _ensure_utf8(_s)
+del _ensure_utf8, _s
+
+# Allow running from project root
+sys.path.insert(0, os.path.dirname(__file__))
+
+from gas_properties import compute_gas_properties, P_STD
+from io_excel        import read_nodes, read_pipes, write_results
+from validate        import validate_network
+from solver          import solve_network
+from postprocess     import print_summary, generate_pressure_map, generate_flow_map
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='  [%(levelname)s] %(message)s'
+)
+log = logging.getLogger(__name__)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="PE80 Gas Distribution Network — Newton-Raphson Hydraulic Solver"
+    )
+    parser.add_argument('--input',    required=True,
+                        help='Path to Excel input file (PE80_Network_Template.xlsx)')
+    parser.add_argument('--output',   default=None,
+                        help='Output file path (default: input file with RESULTS sheet added)')
+    parser.add_argument('--sg',       type=float, default=0.62,
+                        help='Gas specific gravity relative to air (default: 0.62)')
+    parser.add_argument('--temp',     type=float, default=20.0,
+                        help='Flowing temperature [°C] (default: 20)')
+    parser.add_argument('--pressure', type=float, default=300.0,
+                        help='Representative network pressure for gas props [kPa(g)] (default: 300)')
+    parser.add_argument('--tol',      type=float, default=1e-6,
+                        help='Convergence tolerance [Sm³/s] (default: 1e-6)')
+    parser.add_argument('--maxiter',  type=int,   default=100,
+                        help='Maximum Newton-Raphson iterations (default: 100)')
+    parser.add_argument('--map',      action='store_true', default=True,
+                        help='Generate interactive HTML pressure map (default: True)')
+    parser.add_argument('--verbose',  action='store_true', default=True,
+                        help='Print convergence table (default: True)')
+    # If launched with no arguments (e.g. from IDE), auto-detect a single Excel
+    # file in the script directory rather than crashing with SystemExit: 2.
+    if len(sys.argv) == 1:
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        _xlsx = [f for f in os.listdir(_script_dir)
+                 if f.lower().endswith('.xlsx') and 'result' not in f.lower()]
+        if len(_xlsx) == 1:
+            sys.argv.extend(['--input', os.path.join(_script_dir, _xlsx[0])])
+        else:
+            parser.print_help()
+            sys.exit(0)
+
+    args = parser.parse_args()
+
+    # ── Input file ────────────────────────────────────────────────────────────
+    if not os.path.exists(args.input):
+        log.error(f"Input file not found: {args.input}")
+        sys.exit(1)
+
+    # Check required sheets exist before doing anything else
+    from openpyxl import load_workbook as _lw
+    try:
+        _wb = _lw(args.input, read_only=True)
+        _found = _wb.sheetnames
+        _wb.close()
+    except Exception as exc:
+        log.error(f"Cannot open '{args.input}': {exc}")
+        sys.exit(1)
+    for _s in ('NODES', 'PIPES'):
+        if _s not in _found:
+            log.error(f"Sheet '{_s}' not found in '{args.input}'. Sheets present: {_found}")
+            sys.exit(1)
+
+    # Check file is writable (not locked by Excel)
+    try:
+        with open(args.input, 'a'):
+            pass
+    except PermissionError:
+        log.error(f"Cannot write to '{args.input}' -- close the file in Excel first.")
+        sys.exit(1)
+
+    output_path = args.output or args.input
+
+    # Use pathlib to build working path — handles any extension correctly
+    _inp = pathlib.Path(args.input)
+    working_path = str(_inp.with_name(_inp.stem + '_solving' + _inp.suffix)) \
+        if output_path == args.input else args.input
+    if output_path == args.input:
+        shutil.copy(args.input, working_path)
+
+    print(f"\n{'='*60}")
+    print(f"  PE80 Network Hydraulic Solver  v1.0")
+    print(f"{'='*60}")
+    print(f"  Input  : {args.input}")
+    print(f"  Output : {output_path}")
+
+    # ── Read network ──────────────────────────────────────────────────────────
+    log.info("Reading network data from Excel...")
+    nodes = read_nodes(args.input)
+    pipes = read_pipes(args.input)
+
+    if not nodes or not pipes:
+        log.error("No nodes or pipes found. Check sheet names: NODES, PIPES")
+        sys.exit(1)
+
+    # ── Gas properties at representative conditions ───────────────────────────
+    T_K     = args.temp + 273.15                        # °C → K
+    P_abs   = args.pressure * 1000.0 + P_STD            # kPa(g) → Pa(a)
+    gas     = compute_gas_properties(P_abs, T_K, args.sg)
+
+    print(f"\n  Gas properties at {args.temp:.0f}°C, {args.pressure:.0f} kPa(g):")
+    print(f"    SG    = {gas.SG:.3f}")
+    print(f"    Z     = {gas.Z:.4f}")
+    print(f"    rho   = {gas.rho:.3f} kg/m3")
+    print(f"    mu    = {gas.mu:.2e} Pa.s")
+
+    # ── Pre-solve validation ──────────────────────────────────────────────────
+    passed, issues = validate_network(nodes, pipes, verbose=True)
+    if not passed:
+        log.error("Validation failed. Fix errors above before running solver.")
+        sys.exit(1)
+
+    # ── Solve ─────────────────────────────────────────────────────────────────
+    result = solve_network(
+        nodes    = nodes,
+        pipes    = pipes,
+        gas      = gas,
+        tol      = args.tol,
+        max_iter = args.maxiter,
+        verbose  = args.verbose,
+    )
+
+    # ── Post-process ──────────────────────────────────────────────────────────
+    print_summary(nodes, pipes, result, gas)
+
+    # ── Write results to Excel ────────────────────────────────────────────────
+    try:
+        write_results(working_path, nodes, pipes, result, gas)
+        if working_path != output_path:
+            shutil.move(working_path, output_path)
+    except Exception:
+        if working_path != output_path and os.path.exists(working_path):
+            os.remove(working_path)
+        raise
+
+    log.info(f"Results written to: {output_path}")
+
+    # ── Optional HTML maps ────────────────────────────────────────────────────
+    if args.map:
+        _base     = str(pathlib.Path(output_path).with_suffix(''))
+        map_path  = _base + '_pressure_map.html'
+        flow_path = _base + '_flow_map.html'
+        generate_pressure_map(nodes, pipes, map_path)
+        generate_flow_map(nodes, pipes, result, gas, flow_path)
+
+    if not result.converged:
+        log.warning("Solver did not converge -- results may be unreliable.")
+        sys.exit(2)
+
+    print(f"  Done.  {'[OK] Converged' if result.converged else '[FAIL] Did not converge'}\n")
+
+
+if __name__ == '__main__':
+    main()
+
+"""
+network.py — Node/Pipe dataclasses, incidence matrix, connectivity check.
+"""
+import math
+import numpy as np
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple
+
+
+@dataclass
+class Node:
+    id:           str
+    label:        str
+    node_type:    str            # 'source' | 'junction' | 'offtake'
+    elevation:    float = 0.0
+    pressure:     float = 0.0   # Pa(a)
+    demand:       float = 0.0   # Sm³/s  (positive = consumption)
+    min_pressure: float = 0.0   # Pa(a)
+    x_coord:      float = 0.0
+    y_coord:      float = 0.0
+
+    def is_source(self):   return self.node_type == 'source'
+    def is_junction(self): return self.node_type == 'junction'
+    def is_offtake(self):  return self.node_type == 'offtake'
+
+
+@dataclass
+class Pipe:
+    id:        str
+    from_node: str
+    to_node:   str
+    length:    float
+    diameter:  float            # internal [m]
+    roughness: float = 7e-6    # PE80 default [m]
+    status:    str   = 'open'
+    flow:      float = 0.0     # Sm³/s  (set by solver)
+
+    @property
+    def area(self): return math.pi * self.diameter**2 / 4
+
+
+def build_incidence_matrix(nodes: List[Node], pipes: List[Pipe]) -> np.ndarray:
+    """A[i,j] = +1 if pipe j leaves node i, -1 if enters, 0 otherwise."""
+    node_idx = {n.id: i for i, n in enumerate(nodes)}
+    A = np.zeros((len(nodes), len(pipes)), dtype=float)
+    for j, p in enumerate(pipes):
+        if p.from_node not in node_idx:
+            raise ValueError(f"Pipe {p.id}: from_node '{p.from_node}' not in node list")
+        if p.to_node not in node_idx:
+            raise ValueError(f"Pipe {p.id}: to_node '{p.to_node}' not in node list")
+        A[node_idx[p.from_node], j] = +1.0
+        A[node_idx[p.to_node],   j] = -1.0
+    return A
+
+
+def check_connectivity(nodes: List[Node], pipes: List[Pipe]) -> Dict:
+    """BFS from all source nodes.  Handles pipes referencing unknown nodes gracefully."""
+    valid_ids = {n.id for n in nodes}
+    adj: Dict[str, List[str]] = {n.id: [] for n in nodes}
+
+    for pipe in pipes:
+        if pipe.status != 'open':
+            continue
+        # Only add edge if both nodes are known
+        if pipe.from_node in valid_ids and pipe.to_node in valid_ids:
+            adj[pipe.from_node].append(pipe.to_node)
+            adj[pipe.to_node].append(pipe.from_node)
+
+    sources  = {n.id for n in nodes if n.is_source()}
+    visited  = set(sources)
+    queue    = list(sources)
+    while queue:
+        cur = queue.pop(0)
+        for nb in adj.get(cur, []):
+            if nb not in visited:
+                visited.add(nb)
+                queue.append(nb)
+
+    isolated = valid_ids - visited
+    return {'connected': len(isolated) == 0,
+            'reachable': visited, 'isolated': isolated}
+
+
+def partition_nodes(nodes: List[Node]) -> Tuple[List[int], List[int]]:
+    src = [i for i, n in enumerate(nodes) if n.is_source()]
+    unk = [i for i, n in enumerate(nodes) if not n.is_source()]
+    return src, unk
+
+
+def straight_line_distance(n1: Node, n2: Node) -> float:
+    return math.sqrt((n1.x_coord-n2.x_coord)**2 + (n1.y_coord-n2.y_coord)**2)
+
+"""
+postprocess.py
+--------------
+Compute all engineering outputs from converged solver results.
+
+Per-pipe:  flow, velocity, Re, f, ΔP, pressure gradient, loading ratio
+Per-node:  pressure, margin above minimum, supply zone
+Network:   mass balance, maximum velocity, minimum pressure margin
+"""
+
+import math
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Optional
+
+from network        import Node, Pipe
+from hydraulics     import compute_reynolds, erosional_velocity, swamee_jain
+from gas_properties import GasProperties, sm3s_to_m3s, P_STD
+
+
+# ── Limits ────────────────────────────────────────────────────────────────────
+MAX_GRAD_MBAR_M   = 1.0    # mbar/m  — recommended max gradient for distribution
+WARN_LOADING_PCT  = 70.0   # %       — flag pipes above this loading
+CRIT_LOADING_PCT  = 90.0   # %       — critical flag
+
+
+def compute_pipe_results(pipes:  List[Pipe],
+                         nodes:  List[Node],
+                         result,            # SolverResult
+                         gas:    GasProperties) -> pd.DataFrame:
+    """
+    Compute all per-pipe engineering outputs.
+
+    Parameters
+    ----------
+    pipes  : list of Pipe   (with .flow populated by solver)
+    nodes  : list of Node   (with .pressure populated by solver)
+    result : SolverResult
+    gas    : GasProperties
+
+    Returns
+    -------
+    pd.DataFrame  one row per pipe
+    """
+    node_map = {n.id: n for n in nodes}
+    rows = []
+
+    for j, pipe in enumerate(pipes):
+        Q_sm3s = pipe.flow                      # Sm³/s
+        Q_sm3h = Q_sm3s * 3600.0               # Sm³/h
+        Q_abs  = abs(Q_sm3s)
+
+        # Flow direction
+        direction = '->' if Q_sm3s >= 0 else '<-'
+
+        # Actual velocity at average pipe pressure
+        n_from = node_map[pipe.from_node]
+        n_to   = node_map[pipe.to_node]
+        P_from = n_from.pressure
+        P_to   = n_to.pressure
+        P_avg  = (P_from + P_to) / 2.0
+
+        # Create a local gas property at average pressure for velocity calc
+        Q_act  = sm3s_to_m3s(Q_abs, P_avg, gas.T, gas.Z)
+        v      = Q_act / pipe.area if pipe.area > 0 else 0.0
+
+        # Reynolds number
+        Re = compute_reynolds(Q_sm3s, pipe, gas)
+
+        # Friction factor
+        f  = swamee_jain(Re, pipe.roughness, pipe.diameter)
+
+        # Pressure drop [Pa and mbar]
+        dP_Pa   = P_from - P_to              # Pa  (positive = from→to)
+        dP_mbar = dP_Pa / 100.0             # mbar
+
+        # Pressure gradient [mbar/m]
+        grad_mbar_m = abs(dP_mbar) / pipe.length if pipe.length > 0 else 0.0
+
+        # Erosional velocity at average pressure
+        from gas_properties import compute_gas_properties
+        gas_avg = compute_gas_properties(P_avg, gas.T, gas.SG)
+        v_erosional = erosional_velocity(P_avg, gas_avg)
+
+        # Loading ratio = v / v_erosional × 100  [%]
+        loading_pct = (v / v_erosional * 100.0) if v_erosional > 0 else 0.0
+
+        # Status flags
+        flags = []
+        if v > v_erosional:
+            flags.append('[!] EROSIONAL')
+        if grad_mbar_m > MAX_GRAD_MBAR_M:
+            flags.append('[!] HIGH GRAD')
+        if loading_pct > CRIT_LOADING_PCT:
+            flags.append('[!] CRITICAL')
+        elif loading_pct > WARN_LOADING_PCT:
+            flags.append('[!] LOADED')
+        if Q_sm3s < 0:
+            flags.append('[REV] REVERSED')
+        status = ' | '.join(flags) if flags else '[OK]'
+
+        rows.append({
+            'Pipe_ID':      pipe.id,
+            'From':         pipe.from_node,
+            'To':           pipe.to_node,
+            'Q_sm3s':       round(Q_sm3s, 8),
+            'Q_sm3h':       round(Q_sm3h, 3),
+            'Direction':    direction,
+            'v_ms':         round(v, 4),
+            'v_erosional':  round(v_erosional, 3),
+            'Re':           int(Re),
+            'f':            round(f, 6),
+            'dP_Pa':        round(dP_Pa, 2),
+            'dP_mbar':      round(dP_mbar, 3),
+            'Grad_mbar_m':  round(grad_mbar_m, 5),
+            'Loading_pct':  round(loading_pct, 2),
+            'Status':       status,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def compute_node_results(nodes: List[Node],
+                         result) -> pd.DataFrame:
+    """
+    Compute per-node results including pressure margin.
+
+    Parameters
+    ----------
+    nodes  : list of Node  (with solved .pressure)
+    result : SolverResult
+
+    Returns
+    -------
+    pd.DataFrame  one row per node
+    """
+    rows = []
+    for i, n in enumerate(nodes):
+        P_kpag    = (n.pressure - P_STD) / 1000.0   # kPa(g)
+        min_kpag  = (n.min_pressure - P_STD) / 1000.0
+        margin    = P_kpag - min_kpag
+
+        if n.is_source():
+            status = 'SOURCE (fixed P)'
+        elif margin < 0:
+            status = f'[FAIL] BELOW MIN by {abs(margin):.1f} kPa'
+        elif margin < 10:
+            status = f'[!] LOW MARGIN ({margin:.1f} kPa)'
+        else:
+            status = f'[OK] ({margin:.1f} kPa margin)'
+
+        rows.append({
+            'Node_ID':   n.id,
+            'Label':     n.label,
+            'Type':      n.node_type,
+            'P_kPag':    round(P_kpag, 2),
+            'MinP_kPag': round(min_kpag, 2),
+            'Margin_kPa': round(margin, 2),
+            'Status':    status,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def mass_balance(nodes: List[Node],
+                 pipes: List[Pipe]) -> Dict:
+    """
+    Compute network-level mass balance.
+
+    Returns
+    -------
+    dict with keys:
+        total_supply_sm3h  : float
+        total_demand_sm3h  : float
+        imbalance_sm3h     : float
+        balanced           : bool   (imbalance < 0.1 Sm³/h)
+    """
+    node_map = {n.id: n for n in nodes}
+
+    # Supply = net outflow from source nodes = A[src,:] @ Q (signed)
+    # Negative supply means that source is being backfed by the network.
+    import numpy as np
+    from network import build_incidence_matrix
+    A       = build_incidence_matrix(nodes, pipes)
+    src_idx = [i for i, n in enumerate(nodes) if n.is_source()]
+    Q_arr   = np.array([p.flow for p in pipes])
+    supply  = float(np.sum(A[src_idx, :] @ Q_arr)) * 3600
+    demand  = sum(n.demand * 3600 for n in nodes if n.is_offtake())
+    imbal   = supply - demand
+
+    return {
+        'total_supply_sm3h': round(supply, 3),
+        'total_demand_sm3h': round(demand, 3),
+        'imbalance_sm3h':    round(imbal, 4),
+        'balanced':          abs(imbal) < 0.1,
+    }
+
+
+def print_summary(nodes:   List[Node],
+                  pipes:   List[Pipe],
+                  result,
+                  gas:     GasProperties) -> None:
+    """
+    Print a formatted engineering summary to stdout.
+    """
+    pipe_df = compute_pipe_results(pipes, nodes, result, gas)
+    node_df = compute_node_results(nodes, result)
+    mb      = mass_balance(nodes, pipes)
+
+    print("\n" + "="*72)
+    print("  SOLVER RESULT SUMMARY")
+    print("="*72)
+    print(f"  Status     : {'[CONVERGED]' if result.converged else '[NOT CONVERGED]'}")
+    print(f"  Iterations : {result.iterations}")
+    print(f"  max|F|     : {result.final_residual:.3e} Sm³/s")
+
+    print("\n  -- NODE PRESSURES ----------------------------------------------")
+    print(f"  {'Node':<8} {'Label':<16} {'Type':<10} {'P [kPa(g)]':>12} "
+          f"{'Min P':>8} {'Margin':>8}  Status")
+    print(f"  {'-'*72}")
+    for _, row in node_df.iterrows():
+        print(f"  {row['Node_ID']:<8} {row['Label']:<16} {row['Type']:<10} "
+              f"{row['P_kPag']:>12.1f} {row['MinP_kPag']:>8.1f} "
+              f"{row['Margin_kPa']:>8.1f}  {row['Status']}")
+
+    print("\n  -- PIPE FLOWS --------------------------------------------------")
+    print(f"  {'Pipe':<8} {'Route':<20} {'Q [Sm³/h]':>12} {'v [m/s]':>9} "
+          f"{'Re':>10} {'f':>8} {'Grad[mb/m]':>11}  Status")
+    print(f"  {'-'*72}")
+    for _, row in pipe_df.iterrows():
+        route = f"{row['From']}->{row['To']}"
+        print(f"  {row['Pipe_ID']:<8} {route:<20} {row['Q_sm3h']:>12.2f} "
+              f"{row['v_ms']:>9.3f} {row['Re']:>10,} {row['f']:>8.5f} "
+              f"{row['Grad_mbar_m']:>11.4f}  {row['Status']}")
+
+    print("\n  -- MASS BALANCE ------------------------------------------------")
+    print(f"  Total supply : {mb['total_supply_sm3h']:>10.3f} Sm³/h")
+    print(f"  Total demand : {mb['total_demand_sm3h']:>10.3f} Sm³/h")
+    print(f"  Imbalance    : {mb['imbalance_sm3h']:>10.4f} Sm³/h  "
+          f"({'[OK]' if mb['balanced'] else '[CHECK]'})")
+    print("="*72 + "\n")
+
+
+def generate_pressure_map(nodes: List[Node],
+                          pipes: List[Pipe],
+                          output_path: str = "network_pressure_map.html") -> None:
+    """
+    Generate an interactive Plotly pressure map (HTML file).
+
+    Requires plotly to be installed: pip install plotly
+
+    Parameters
+    ----------
+    nodes       : list of Node  (with GIS coordinates and solved pressures)
+    pipes       : list of Pipe
+    output_path : str  path to write the HTML file
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        print("plotly not installed. Run: pip install plotly")
+        return
+
+    node_map = {n.id: n for n in nodes}
+
+    # Node pressures in kPa(g) for colour scale
+    P_kpag   = [(n.pressure - P_STD) / 1000.0 for n in nodes]
+    P_min    = min(P_kpag)
+    P_max    = max(P_kpag)
+
+    # Pipe traces
+    pipe_traces = []
+    for pipe in pipes:
+        nf = node_map[pipe.from_node]
+        nt = node_map[pipe.to_node]
+        pipe_traces.append(go.Scatter(
+            x=[nf.x_coord, nt.x_coord, None],
+            y=[nf.y_coord, nt.y_coord, None],
+            mode='lines',
+            line=dict(color='steelblue', width=3),
+            hoverinfo='skip',
+            showlegend=False,
+        ))
+
+    # Node trace
+    color_map = {'source': 'gold', 'junction': 'cornflowerblue', 'offtake': 'mediumseagreen'}
+    sym_map   = {'source': 'diamond', 'junction': 'circle', 'offtake': 'square'}
+
+    for ntype in ['source', 'junction', 'offtake']:
+        subset = [n for n in nodes if n.node_type == ntype]
+        if not subset:
+            continue
+        pipe_traces.append(go.Scatter(
+            x=[n.x_coord for n in subset],
+            y=[n.y_coord for n in subset],
+            mode='markers+text',
+            marker=dict(
+                symbol=sym_map[ntype],
+                size=16,
+                color=[(n.pressure - P_STD)/1000.0 for n in subset],
+                colorscale='RdYlGn',
+                cmin=P_min, cmax=P_max,
+                showscale=(ntype == 'offtake'),
+                colorbar=dict(title='Pressure<br>[kPa(g)]') if ntype == 'offtake' else None,
+                line=dict(color=color_map[ntype], width=2),
+            ),
+            text=[f"{n.id}<br>{n.label}" for n in subset],
+            textposition='top center',
+            name=ntype.capitalize(),
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "P = %{marker.color:.1f} kPa(g)<br>"
+                "Type: " + ntype + "<extra></extra>"
+            ),
+        ))
+
+    fig = go.Figure(data=pipe_traces)
+    fig.update_layout(
+        title="PE80 Network — Nodal Pressure Map",
+        xaxis_title="Easting [m]",
+        yaxis_title="Northing [m]",
+        xaxis=dict(scaleanchor="y", scaleratio=1),
+        height=700,
+        template="plotly_white",
+        legend=dict(x=0.01, y=0.99),
+    )
+    fig.write_html(output_path)
+    print(f"Pressure map saved to: {output_path}")
+
+
+def generate_flow_map(nodes:   List[Node],
+                      pipes:   List[Pipe],
+                      result,
+                      gas:     'GasProperties',
+                      output_path: str = "network_flow_map.html") -> None:
+    """
+    Generate an interactive Plotly flow map (HTML).
+
+    Pipes are drawn with width proportional to |Q|, coloured by status
+    (normal / reversed / high-gradient / erosional), with directional
+    arrowheads at the pipe midpoint.  Nodes are coloured by pressure.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        print("plotly not installed. Run: pip install plotly")
+        return
+
+    node_map  = {n.id: n for n in nodes}
+    pipe_df   = compute_pipe_results(pipes, nodes, result, gas)
+    pipe_info = {row['Pipe_ID']: row for _, row in pipe_df.iterrows()}
+
+    flows_abs = [abs(pipe_info[p.id]['Q_sm3h']) for p in pipes]
+    max_flow  = max(flows_abs) if flows_abs else 1.0
+
+    P_kpag = [(n.pressure - P_STD) / 1000.0 for n in nodes]
+    P_min  = min(P_kpag)
+    P_max  = max(P_kpag)
+
+    STATUS_COLOR = {
+        '[OK]':      'steelblue',
+        'REVERSED':  'darkorange',
+        'HIGH GRAD': 'crimson',
+        'EROSIONAL': 'darkred',
+        'CRITICAL':  'darkred',
+        'LOADED':    'goldenrod',
+    }
+
+    def _pipe_color(status: str) -> str:
+        for key, col in STATUS_COLOR.items():
+            if key in status:
+                return col
+        return 'steelblue'
+
+    traces = []
+
+    # ── Invisible midpoint scatter for hover ─────────────────────────────
+    mid_x, mid_y, hover_text = [], [], []
+    for pipe in pipes:
+        nf  = node_map[pipe.from_node]
+        nt  = node_map[pipe.to_node]
+        inf = pipe_info[pipe.id]
+        mid_x.append((nf.x_coord + nt.x_coord) / 2)
+        mid_y.append((nf.y_coord + nt.y_coord) / 2)
+        hover_text.append(
+            f"<b>{pipe.id}</b>  {nf.id} {inf['Direction']} {nt.id}<br>"
+            f"Q  = {inf['Q_sm3h']:+.1f} Sm³/h<br>"
+            f"v  = {inf['v_ms']:.3f} m/s  (v_ero = {inf['v_erosional']:.2f})<br>"
+            f"Re = {inf['Re']:,}<br>"
+            f"f  = {inf['f']:.5f}<br>"
+            f"ΔP = {inf['dP_mbar']:.2f} mbar<br>"
+            f"∇P = {inf['Grad_mbar_m']:.4f} mbar/m<br>"
+            f"Load = {inf['Loading_pct']:.1f}%<br>"
+            f"<b>{inf['Status']}</b>"
+        )
+
+    traces.append(go.Scatter(
+        x=mid_x, y=mid_y,
+        mode='markers',
+        marker=dict(size=14, color='rgba(0,0,0,0)'),
+        hovertext=hover_text,
+        hoverinfo='text',
+        showlegend=False,
+    ))
+
+    # ── Pipe lines + direction arrows ─────────────────────────────────────
+    annotations = []
+    for pipe in pipes:
+        nf  = node_map[pipe.from_node]
+        nt  = node_map[pipe.to_node]
+        inf = pipe_info[pipe.id]
+        Q   = inf['Q_sm3h']
+        col = _pipe_color(inf['Status'])
+        lw  = max(2.0, min(12.0, 2.0 + 10.0 * abs(Q) / max_flow))
+
+        traces.append(go.Scatter(
+            x=[nf.x_coord, nt.x_coord, None],
+            y=[nf.y_coord, nt.y_coord, None],
+            mode='lines',
+            line=dict(color=col, width=lw),
+            hoverinfo='skip',
+            showlegend=False,
+        ))
+
+        # Arrow placed at 40% → 62% of segment (in actual flow direction)
+        dx = nt.x_coord - nf.x_coord
+        dy = nt.y_coord - nf.y_coord
+        if Q >= 0:
+            ax, ay = nf.x_coord + 0.38*dx, nf.y_coord + 0.38*dy
+            ex, ey = nf.x_coord + 0.62*dx, nf.y_coord + 0.62*dy
+        else:
+            ax, ay = nf.x_coord + 0.62*dx, nf.y_coord + 0.62*dy
+            ex, ey = nf.x_coord + 0.38*dx, nf.y_coord + 0.38*dy
+
+        annotations.append(dict(
+            x=ex, y=ey, ax=ax, ay=ay,
+            xref='x', yref='y', axref='x', ayref='y',
+            arrowhead=2, arrowsize=1.5, arrowwidth=max(1.5, lw * 0.5),
+            arrowcolor=col,
+            showarrow=True, text='',
+        ))
+
+    # ── Pipe ID labels at midpoint ────────────────────────────────────────
+    traces.append(go.Scatter(
+        x=mid_x, y=mid_y,
+        mode='text',
+        text=[pipe_info[p.id]['Pipe_ID'] for p in pipes],
+        textfont=dict(size=9, color='dimgray'),
+        hoverinfo='skip',
+        showlegend=False,
+    ))
+
+    # ── Node markers coloured by pressure ────────────────────────────────
+    color_map = {'source': 'gold', 'junction': 'cornflowerblue', 'offtake': 'mediumseagreen'}
+    sym_map   = {'source': 'diamond', 'junction': 'circle', 'offtake': 'square'}
+
+    for ntype in ['source', 'junction', 'offtake']:
+        subset = [n for n in nodes if n.node_type == ntype]
+        if not subset:
+            continue
+        P_vals = [(n.pressure - P_STD) / 1000.0 for n in subset]
+        demand_vals = [n.demand * 3600 for n in subset]
+        traces.append(go.Scatter(
+            x=[n.x_coord for n in subset],
+            y=[n.y_coord for n in subset],
+            mode='markers+text',
+            marker=dict(
+                symbol=sym_map[ntype],
+                size=18,
+                color=P_vals,
+                colorscale='RdYlGn',
+                cmin=P_min, cmax=P_max,
+                showscale=(ntype == 'offtake'),
+                colorbar=dict(title='Pressure<br>[kPa(g)]', x=1.02) if ntype == 'offtake' else None,
+                line=dict(color=color_map[ntype], width=2),
+            ),
+            text=[f"{n.id}<br>{n.label}" for n in subset],
+            textposition='top center',
+            name=ntype.capitalize(),
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "P = %{marker.color:.1f} kPa(g)<br>"
+                f"Demand = " + "%{customdata:.0f} Sm³/h<br>" +
+                "Type: " + ntype + "<extra></extra>"
+            ),
+            customdata=demand_vals,
+        ))
+
+    # ── Legend items for pipe status colours ─────────────────────────────
+    legend_items = [
+        ('Normal flow',      'steelblue'),
+        ('Reversed flow',    'darkorange'),
+        ('High gradient',    'crimson'),
+        ('Erosional/Crit.',  'darkred'),
+    ]
+    for label, col in legend_items:
+        traces.append(go.Scatter(
+            x=[None], y=[None],
+            mode='lines',
+            line=dict(color=col, width=4),
+            name=label,
+            showlegend=True,
+        ))
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        annotations=annotations,
+        title="PE80 Network — Flow Map  (width ∝ |Q|, arrows show direction)",
+        xaxis_title="Easting [m]",
+        yaxis_title="Northing [m]",
+        xaxis=dict(scaleanchor="y", scaleratio=1),
+        height=750,
+        template="plotly_white",
+        legend=dict(x=0.01, y=0.99, bgcolor='rgba(255,255,255,0.8)', bordercolor='gray', borderwidth=1),
+    )
+    fig.write_html(output_path)
+    print(f"Flow map saved to: {output_path}")
+
+"""
+solver.py — Newton-Raphson solver in Φ = P² (node potential) space.
+
+Working in Φ space avoids the chain-rule and gives a symmetric,
+positive-definite Jacobian that is well-conditioned for connected networks.
+
+Algorithm
+---------
+  1. Build incidence matrix A; partition into source / unknown nodes.
+  2. Initialise Φ_unknown via BFS pressure propagation from sources
+     (estimates ΔΦ per pipe from expected demand flow).
+  3. Iterate Newton-Raphson in Φ space:
+       a. Compute K (pipe conductances, updated friction factors)
+       b. Compute ΔΦ, flows Q, continuity residual F
+       c. Jacobian  J = A_u @ diag(W) @ A_u^T
+       d. Solve J·δΦ = −F
+       e. Backtracking line search
+       f. Clamp Φ ≥ Φ_floor; restore fixed-source Φ values
+  4. Post-convergence: recover P = sqrt(Φ); write back to nodes/pipes.
+"""
+
+import math
+import numpy as np
+import logging
+from dataclasses import dataclass
+from typing import List
+
+from network    import Node, Pipe, build_incidence_matrix, partition_nodes
+from hydraulics import (compute_pipe_conductance, delta_phi, compute_flows_phi,
+                          compute_residual, compute_jacobian_phi,
+                          compute_friction_factors, swamee_jain, EPS_PHI)
+from gas_properties import GasProperties, P_STD
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class SolverResult:
+    converged:      bool
+    iterations:     int
+    final_residual: float
+    P_all:          np.ndarray   # Pa(a)
+    Q:              np.ndarray   # Sm³/s
+    f:              np.ndarray   # Darcy friction factors
+    Re:             np.ndarray   # Reynolds numbers
+    message:        str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def _bfs_init_phi(nodes, pipes, src_idx, unk_idx, node_idx,
+                  Phi_src, gas, p_floor):
+    """
+    Initialise Φ for unknown nodes via BFS from sources.
+
+    For each pipe in BFS order, estimate ΔΦ from the cumulative downstream
+    demand divided by an initial conductance (f = 0.02 conservative).
+    Sets each unknown Φ = Φ_parent − ΔΦ_est, clamped to Φ_floor.
+    """
+    Phi_all = np.zeros(len(nodes))
+    for i in src_idx:
+        Phi_all[i] = nodes[i].pressure ** 2
+
+    # Initial conductances with conservative friction
+    f0 = np.array([swamee_jain(1e5, p.roughness, p.diameter) for p in pipes])
+    K0 = np.array([compute_pipe_conductance(p, f0[j], gas)
+                   for j, p in enumerate(pipes)])
+
+    # Build adjacency with pipe index
+    from collections import deque
+    node_map  = {n.id: i for i, n in enumerate(nodes)}
+    adj = {n.id: [] for n in nodes}   # node_id → [(neighbour_id, pipe_idx)]
+    for j, p in enumerate(pipes):
+        if p.status == 'open':
+            adj[p.from_node].append((p.to_node, j,  1))   # +1: flow leaves from_node
+            adj[p.to_node].append(  (p.from_node, j, -1))
+
+    # Total demand downstream of each node (rough BFS-order estimate)
+    total_demand = sum(n.demand for n in nodes if n.is_offtake())
+
+    visited = set(n.id for n in nodes if n.is_source())
+    queue   = deque(n.id for n in nodes if n.is_source())
+    Phi_floor = p_floor ** 2
+
+    while queue:
+        cur_id = queue.popleft()
+        cur_i  = node_map[cur_id]
+        for (nb_id, j, sign) in adj[cur_id]:
+            if nb_id in visited:
+                continue
+            nb_i = node_map[nb_id]
+            if nodes[nb_i].is_source():
+                Phi_all[nb_i] = nodes[nb_i].pressure ** 2
+                visited.add(nb_id)
+                queue.append(nb_id)
+                continue
+
+            # Estimate flow as fraction of total demand
+            Q_est = max(nodes[nb_i].demand, total_demand * 0.05)
+            K_j   = max(K0[j], 1e-15)
+            dPhi  = (Q_est / K_j) ** 2
+            Phi_all[nb_i] = max(Phi_all[cur_i] - dPhi, Phi_floor)
+            visited.add(nb_id)
+            queue.append(nb_id)
+
+    # Any still-unvisited unknowns → set to min source Phi × 0.9
+    min_src_phi = min(Phi_all[i] for i in src_idx)
+    for i in unk_idx:
+        if Phi_all[i] == 0:
+            Phi_all[i] = max(min_src_phi * 0.9, Phi_floor)
+
+    return Phi_all
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def solve_network(
+    nodes:       List[Node],
+    pipes:       List[Pipe],
+    gas:         GasProperties,
+    tol:         float = 1e-6,
+    max_iter:    int   = 150,
+    damping:     float = 1.0,
+    min_damping: float = 0.001,
+    p_floor:     float = P_STD,
+    verbose:     bool  = True,
+) -> SolverResult:
+    """
+    Newton-Raphson solver in Φ = P² space.
+
+    Parameters
+    ----------
+    nodes       : list of Node  (sources carry fixed pressures)
+    pipes       : list of Pipe  (open pipes only)
+    gas         : GasProperties at representative network conditions
+    tol         : convergence tolerance [Sm³/s]
+    max_iter    : maximum iterations
+    damping     : initial Newton step size
+    min_damping : minimum after backtracking
+    p_floor     : minimum allowable pressure [Pa(a)]
+    verbose     : print convergence table
+    """
+    n_nodes = len(nodes)
+    n_pipes = len(pipes)
+    node_idx = {n.id: i for i, n in enumerate(nodes)}
+
+    if n_nodes == 0 or n_pipes == 0:
+        return SolverResult(False, 0, float('inf'),
+                            np.zeros(0), np.zeros(0),
+                            np.zeros(0), np.zeros(0), "Empty network")
+
+    A = build_incidence_matrix(nodes, pipes)
+    src_idx, unk_idx = partition_nodes(nodes)
+
+    if not src_idx:
+        return SolverResult(False, 0, float('inf'),
+                            np.zeros(n_nodes), np.zeros(n_pipes),
+                            np.zeros(n_pipes), np.zeros(n_pipes),
+                            "No source nodes found")
+
+    A_u   = A[unk_idx, :]            # (n_u × n_pipes)
+    n_u   = len(unk_idx)
+    D_u   = np.array([nodes[i].demand for i in unk_idx])
+    Phi_floor = p_floor ** 2
+
+    # ── Smart initial Φ via BFS ───────────────────────────────────────────────
+    Phi_all = _bfs_init_phi(nodes, pipes, src_idx, unk_idx,
+                             node_idx, None, gas, p_floor)
+
+    # ── Initial friction factors (fully-turbulent estimate) ───────────────────
+    f = np.array([swamee_jain(1e5, p.roughness, p.diameter) for p in pipes])
+
+    if verbose:
+        print(f"\n{'='*64}")
+        print(f"  PE80 Network Solver  (N-R in Phi=P^2 space)")
+        print(f"  Nodes: {n_nodes}  Pipes: {n_pipes}  "
+              f"Unknowns: {n_u}  tol: {tol:.1e} Sm³/s")
+        print(f"{'='*64}")
+        print(f"  {'Iter':>4}  {'max|F| [Sm3/s]':>18}  {'Step a':>8}")
+        print(f"  {'-'*36}")
+
+    res_norm = float('inf')
+    alpha    = damping
+
+    for iteration in range(max_iter):
+
+        # 1. Conductances from current friction factors
+        K = np.array([compute_pipe_conductance(pipes[j], f[j], gas)
+                      for j in range(n_pipes)])
+
+        # 2. ΔΦ, flows, residual
+        dphi = delta_phi(Phi_all, A)
+        Q    = compute_flows_phi(dphi, K)
+        F    = compute_residual(Q, A_u, D_u)
+        res_norm = float(np.max(np.abs(F)))
+
+        if verbose:
+            print(f"  {iteration:>4}  {res_norm:>18.6e}  "
+                  f"{'---':>8}" if iteration == 0
+                  else f"  {iteration:>4}  {res_norm:>18.6e}  {alpha:>8.4f}")
+
+        if res_norm < tol:
+            if verbose:
+                print(f"  {'-'*36}")
+                print(f"  Converged in {iteration} iter. "
+                      f"max|F| = {res_norm:.3e} Sm³/s\n{'='*64}\n")
+            break
+
+        # 3. Jacobian in Φ space (symmetric, positive-definite)
+        J = compute_jacobian_phi(A_u, K, dphi)
+
+        # Regularise if near-singular (isolated node guard)
+        J += np.eye(n_u) * 1e-30
+
+        # 4. Solve J·δΦ = −F
+        try:
+            delta_Phi_u = np.linalg.solve(J, -F)
+        except np.linalg.LinAlgError:
+            return SolverResult(False, iteration, res_norm,
+                                np.sqrt(np.maximum(Phi_all, 0)),
+                                Q, f, np.zeros(n_pipes),
+                                "Singular Jacobian -- network disconnected?")
+
+        # 5. Backtracking line search
+        alpha = damping
+        for _ in range(16):
+            Phi_trial = Phi_all.copy()
+            for k, idx in enumerate(unk_idx):
+                Phi_trial[idx] += alpha * delta_Phi_u[k]
+
+            # Clamp: Φ ≥ floor; restore fixed sources
+            Phi_trial = np.maximum(Phi_trial, Phi_floor)
+            for i in src_idx:
+                Phi_trial[i] = nodes[i].pressure ** 2
+
+            dphi_t  = delta_phi(Phi_trial, A)
+            Q_t     = compute_flows_phi(dphi_t, K)
+            F_t     = compute_residual(Q_t, A_u, D_u)
+            res_t   = float(np.max(np.abs(F_t)))
+
+            if res_t < res_norm or alpha <= min_damping:
+                break
+            alpha *= 0.5
+
+        Phi_all = Phi_trial
+
+        # 6. Update friction factors
+        f = compute_friction_factors(pipes, Q, gas)
+
+    else:
+        if verbose:
+            print(f"  WARNING: max_iter={max_iter} reached. "
+                  f"max|F|={res_norm:.3e} Sm³/s")
+
+    # ── Final quantities ──────────────────────────────────────────────────────
+    K    = np.array([compute_pipe_conductance(pipes[j], f[j], gas)
+                     for j in range(n_pipes)])
+    dphi = delta_phi(Phi_all, A)
+    Q    = compute_flows_phi(dphi, K)
+
+    from hydraulics import compute_reynolds
+    Re   = np.array([compute_reynolds(Q[j], pipes[j], gas)
+                     for j in range(n_pipes)])
+
+    P_all = np.sqrt(np.maximum(Phi_all, 0.0))
+
+    # Write back to objects
+    for j, pipe in enumerate(pipes):
+        pipe.flow = float(Q[j])
+    for i, node in enumerate(nodes):
+        node.pressure = float(P_all[i])
+
+    converged = res_norm < tol
+    msg = (f"Converged in {iteration+1} iter, max|F|={res_norm:.2e} Sm³/s"
+           if converged else
+           f"Not converged after {max_iter} iter, max|F|={res_norm:.2e} Sm³/s")
+
+    return SolverResult(converged=converged, iterations=iteration+1,
+                        final_residual=res_norm, P_all=P_all,
+                        Q=Q, f=f, Re=Re, message=msg)
+
+"""
+tests/test_solver.py — Validation test suite for the PE80 hydraulic solver.
+Run:  python -m pytest tests/ -v
+"""
+import math, sys, os
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from src.gas_properties import (z_papay, gas_density, gas_viscosity_lee_kesler,
+                                  compute_gas_properties, P_STD, T_STD)
+from src.network   import (Node, Pipe, build_incidence_matrix,
+                            check_connectivity, partition_nodes)
+from src.hydraulics import (swamee_jain, compute_reynolds,
+                             compute_pipe_conductance, delta_phi,
+                             compute_flows_phi, compute_residual,
+                             compute_jacobian_phi)
+from src.solver    import solve_network
+from src.validate  import validate_network
+
+
+# ═══════════════════════════════════════════════════════════════
+# GAS PROPERTIES
+# ═══════════════════════════════════════════════════════════════
+
+class TestGasProperties:
+
+    def test_z_atm(self):
+        """Z ≈ 1 at atmospheric (Papay gives ~0.997)."""
+        Z = z_papay(P_STD, 293.15, SG=0.62)
+        assert 0.97 < Z < 1.02, f"Z={Z:.4f}"
+
+    def test_z_4bar(self):
+        """Z at 4 bar(g): Papay with correct Ppc gives ~0.985."""
+        Z = z_papay(4e5 + P_STD, 293.15, SG=0.62)
+        assert 0.97 < Z < 0.995, f"Z={Z:.4f}"
+
+    def test_density_increases_with_pressure(self):
+        rho1 = gas_density(P_STD,       293.15, 0.62)
+        rho2 = gas_density(4e5 + P_STD, 293.15, 0.62)
+        assert rho2 > rho1
+
+    def test_density_at_std(self):
+        """ρ at standard conditions ≈ 0.72–0.76 kg/m³ for SG=0.62."""
+        rho = gas_density(P_STD, T_STD, 0.62)
+        assert 0.70 < rho < 0.80, f"rho={rho:.4f}"
+
+    def test_viscosity_magnitude(self):
+        """μ ≈ 1.1e-5 Pa·s for nat gas at 20°C.  Lee-Kesler needs T in °R."""
+        rho = gas_density(P_STD, 293.15, 0.62)
+        mu  = gas_viscosity_lee_kesler(rho, 293.15)
+        assert 8e-6 < mu < 2e-5, f"mu={mu:.2e}"
+
+    def test_gas_props_dataclass(self):
+        gas = compute_gas_properties(4e5 + P_STD, 293.15)
+        assert gas.Z > 0 and gas.rho > 0 and gas.mu > 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# FRICTION FACTOR
+# ═══════════════════════════════════════════════════════════════
+
+class TestFrictionFactor:
+
+    def test_laminar(self):
+        f = swamee_jain(1000, 7e-6, 0.1)
+        assert abs(f - 64/1000) < 1e-6
+
+    def test_turbulent_smooth(self):
+        f = swamee_jain(1e6, 7e-6, 0.1)
+        assert 0.010 < f < 0.016
+
+    def test_f_decreases_with_Re(self):
+        f1 = swamee_jain(1e4, 7e-6, 0.1)
+        f2 = swamee_jain(1e5, 7e-6, 0.1)
+        f3 = swamee_jain(1e6, 7e-6, 0.1)
+        assert f1 > f2 > f3
+
+    def test_rougher_pipe_higher_f(self):
+        f_pe = swamee_jain(1e5, 7e-6,  0.1)
+        f_st = swamee_jain(1e5, 46e-6, 0.1)
+        assert f_st > f_pe
+
+
+# ═══════════════════════════════════════════════════════════════
+# TOPOLOGY
+# ═══════════════════════════════════════════════════════════════
+
+class TestTopology:
+
+    def _net(self):
+        nodes = [Node('N1','Src','source',pressure=5e5+P_STD),
+                 Node('N2','Mid','junction'),
+                 Node('N3','End','offtake',demand=0.10)]
+        pipes = [Pipe('P1','N1','N2',500,0.1),
+                 Pipe('P2','N2','N3',300,0.08)]
+        return nodes, pipes
+
+    def test_incidence_shape(self):
+        n, p = self._net()
+        assert build_incidence_matrix(n, p).shape == (3, 2)
+
+    def test_incidence_values(self):
+        n, p = self._net()
+        A = build_incidence_matrix(n, p)
+        assert A[0,0]==+1 and A[1,0]==-1
+        assert A[1,1]==+1 and A[2,1]==-1
+
+    def test_column_sums_zero(self):
+        n, p = self._net()
+        A = build_incidence_matrix(n, p)
+        assert np.allclose(A.sum(axis=0), 0)
+
+    def test_connected(self):
+        n, p = self._net()
+        assert check_connectivity(n, p)['connected']
+
+    def test_disconnected(self):
+        n, p = self._net()
+        assert not check_connectivity(n, [])['connected']
+
+    def test_partition(self):
+        n, p = self._net()
+        src, unk = partition_nodes(n)
+        assert src == [0] and unk == [1, 2]
+
+
+# ═══════════════════════════════════════════════════════════════
+# SINGLE PIPE
+# ═══════════════════════════════════════════════════════════════
+
+class TestSinglePipe:
+    """D=97mm, L=1000m, Q=0.10 Sm³/s (realistic for this size)."""
+    P1  = 400e3 + P_STD
+    D   = 0.09706; L = 1000.0; eps = 7e-6
+
+    def _setup(self, demand=0.10):
+        nodes = [Node('N1','PRS','source', pressure=self.P1),
+                 Node('N2','End','offtake',demand=demand)]
+        pipes = [Pipe('P1','N1','N2', self.L, self.D, self.eps)]
+        gas   = compute_gas_properties(self.P1, 293.15, 0.62)
+        return nodes, pipes, gas
+
+    def test_conductance_positive(self):
+        nodes, pipes, gas = self._setup()
+        f = swamee_jain(5e4, self.eps, self.D)
+        K = compute_pipe_conductance(pipes[0], f, gas)
+        assert K > 0, f"K={K}"
+
+    def test_converges(self):
+        nodes, pipes, gas = self._setup(demand=0.10)
+        r = solve_network(nodes, pipes, gas, tol=1e-8, verbose=False)
+        assert r.converged, r.message
+
+    def test_flow_direction(self):
+        nodes, pipes, gas = self._setup(demand=0.10)
+        r = solve_network(nodes, pipes, gas, tol=1e-8, verbose=False)
+        assert r.Q[0] > 0
+
+    def test_mass_balance(self):
+        nodes, pipes, gas = self._setup(demand=0.10)
+        r = solve_network(nodes, pipes, gas, tol=1e-8, verbose=False)
+        assert abs(abs(r.Q[0]) - nodes[1].demand) < 1e-6
+
+
+# ═══════════════════════════════════════════════════════════════
+# SERIES PIPES
+# ═══════════════════════════════════════════════════════════════
+
+class TestSeriesPipes:
+    """N1(src) → N2(junc) → N3(offtake), realistic 0.08 Sm³/s demand."""
+
+    def _setup(self):
+        P1 = 400e3 + P_STD
+        nodes = [Node('N1','PRS','source',  pressure=P1),
+                 Node('N2','Mid','junction'),
+                 Node('N3','End','offtake', demand=0.08)]
+        pipes = [Pipe('P1','N1','N2',600,0.12,7e-6),
+                 Pipe('P2','N2','N3',400,0.09,7e-6)]
+        gas = compute_gas_properties(P1, 293.15, 0.62)
+        return nodes, pipes, gas
+
+    def test_converges(self):
+        n,p,g = self._setup()
+        r = solve_network(n,p,g, tol=1e-8, verbose=False)
+        assert r.converged, r.message
+
+    def test_equal_flow_in_series(self):
+        n,p,g = self._setup()
+        r = solve_network(n,p,g, tol=1e-8, verbose=False)
+        assert abs(abs(r.Q[0]) - abs(r.Q[1])) < 1e-7
+
+    def test_pressure_decreases(self):
+        n,p,g = self._setup()
+        r = solve_network(n,p,g, tol=1e-8, verbose=False)
+        assert r.P_all[1] < r.P_all[0]
+
+    def test_mass_balance(self):
+        n,p,g = self._setup()
+        r = solve_network(n,p,g, tol=1e-8, verbose=False)
+        supply = abs(r.Q[0]) * 3600
+        demand = n[2].demand * 3600
+        assert abs(supply - demand) < 0.001
+
+
+# ═══════════════════════════════════════════════════════════════
+# SIMPLE LOOP (4-node square)
+# ═══════════════════════════════════════════════════════════════
+
+class TestSimpleLoop:
+
+    def _setup(self):
+        P1 = 400e3 + P_STD
+        nodes = [Node('N1','PRS', 'source',  pressure=P1),
+                 Node('N2','TEE1','junction'),
+                 Node('N3','TEE2','junction'),
+                 Node('N4','End', 'offtake', demand=0.10)]
+        pipes = [Pipe('P1','N1','N2',500,0.10,7e-6),
+                 Pipe('P2','N2','N3',400,0.08,7e-6),
+                 Pipe('P3','N3','N4',300,0.08,7e-6),
+                 Pipe('P4','N1','N4',600,0.08,7e-6)]
+        gas = compute_gas_properties(P1, 293.15, 0.62)
+        return nodes, pipes, gas
+
+    def test_converges(self):
+        n,p,g = self._setup()
+        r = solve_network(n,p,g, tol=1e-8, verbose=False)
+        assert r.converged, r.message
+
+    def test_node_continuity(self):
+        n,p,g = self._setup()
+        r = solve_network(n,p,g, tol=1e-8, verbose=False)
+        A   = build_incidence_matrix(n, p)
+        net = A @ r.Q
+        assert abs(net[1]) < 1e-7, f"N2 imbalance: {net[1]:.2e}"
+        assert abs(net[2]) < 1e-7, f"N3 imbalance: {net[2]:.2e}"
+
+    def test_mass_balance(self):
+        n,p,g = self._setup()
+        r = solve_network(n,p,g, tol=1e-8, verbose=False)
+        supply = (abs(r.Q[0]) + abs(r.Q[3])) * 3600
+        demand = n[3].demand * 3600
+        assert abs(supply - demand) < 0.01
+
+    def test_pressure_loop_closure(self):
+        n,p,g = self._setup()
+        r = solve_network(n,p,g, tol=1e-8, verbose=False)
+        P = r.P_all
+        loop = (P[0]-P[1]) + (P[1]-P[2]) + (P[2]-P[3]) + (P[3]-P[0])
+        assert abs(loop) < 1.0, f"Loop ΔP sum = {loop:.2f} Pa"
+
+
+# ═══════════════════════════════════════════════════════════════
+# VALIDATION
+# ═══════════════════════════════════════════════════════════════
+
+class TestValidation:
+
+    def test_passes_valid(self):
+        n = [Node('N1','PRS','source', pressure=4e5+P_STD),
+             Node('N2','End','offtake',demand=0.10)]
+        p = [Pipe('P1','N1','N2',500,0.1)]
+        ok, _ = validate_network(n, p, verbose=False)
+        assert ok
+
+    def test_fails_no_source(self):
+        n = [Node('N1','End','offtake',demand=0.10)]
+        ok, errs = validate_network(n, [], verbose=False)
+        assert not ok
+        assert any('source' in e.lower() for e in errs)
+
+    def test_fails_no_offtake(self):
+        n = [Node('N1','PRS','source',pressure=4e5+P_STD)]
+        ok, _ = validate_network(n, [], verbose=False)
+        assert not ok
+
+    def test_fails_disconnected(self):
+        n = [Node('N1','PRS','source', pressure=4e5+P_STD),
+             Node('N2','End','offtake',demand=0.10)]
+        ok, errs = validate_network(n, [], verbose=False)
+        assert not ok
+
+    def test_fails_duplicate_pipe(self):
+        n = [Node('N1','PRS','source', pressure=4e5+P_STD),
+             Node('N2','End','offtake',demand=0.10)]
+        p = [Pipe('P1','N1','N2',500,0.1), Pipe('P2','N1','N2',500,0.1)]
+        ok, errs = validate_network(n, p, verbose=False)
+        assert not ok
+        assert any('duplicate' in e.lower() for e in errs)
+
+    def test_fails_missing_node(self):
+        """Missing node must fail without crashing (KeyError fixed)."""
+        n = [Node('N1','PRS','source',pressure=4e5+P_STD)]
+        p = [Pipe('P1','N1','N99',500,0.1)]
+        ok, errs = validate_network(n, p, verbose=False)
+        assert not ok
+
+
+# ═══════════════════════════════════════════════════════════════
+# TWO-SOURCE NETWORK (matches Excel template)
+# ═══════════════════════════════════════════════════════════════
+
+class TestTwoSources:
+
+    def _setup(self):
+        nodes = [
+            Node('N001','PRS1',   'source',  pressure=400e3+P_STD),
+            Node('N002','TEE1',   'junction'),
+            Node('N003','TEE2',   'junction'),
+            Node('N004','TEE3',   'junction'),
+            Node('N005','Client1','offtake', demand=0.010),
+            Node('N006','Client2','offtake', demand=0.015),
+            Node('N007','Client3','offtake', demand=0.050),
+            Node('N008','Client4','offtake', demand=0.008),
+            Node('N009','PRS2',   'source',  pressure=375e3+P_STD),
+            Node('N010','Client5','offtake', demand=0.025),
+        ]
+        pipes = [
+            Pipe('P001','N001','N002',850, 0.1474,7e-6),
+            Pipe('P002','N002','N003',420, 0.1153,7e-6),
+            Pipe('P003','N002','N004',380, 0.1153,7e-6),
+            Pipe('P004','N003','N005',310, 0.0829,7e-6),
+            Pipe('P005','N003','N006',290, 0.1014,7e-6),
+            Pipe('P006','N004','N007',260, 0.1014,7e-6),
+            Pipe('P007','N004','N008',440, 0.0580,7e-6),
+            Pipe('P008','N009','N004',620, 0.1153,7e-6),
+            Pipe('P009','N004','N010',415, 0.0829,7e-6),
+        ]
+        gas = compute_gas_properties(4e5+P_STD, 293.15, 0.62)
+        return nodes, pipes, gas
+
+    def test_converges(self):
+        n, p, g = self._setup()
+        r = solve_network(n, p, g, tol=1e-7, verbose=False)
+        assert r.converged, r.message
+
+    def test_pressures_above_atmospheric(self):
+        n, p, g = self._setup()
+        r = solve_network(n, p, g, tol=1e-7, verbose=False)
+        assert all(P > P_STD for P in r.P_all)
+
+    def test_mass_balance(self):
+        n, p, g = self._setup()
+        r = solve_network(n, p, g, tol=1e-7, verbose=False)
+        total_demand = sum(nd.demand for nd in n if nd.is_offtake()) * 3600
+        # Supply = net outflow from all source nodes = -(A[src,:] @ Q)
+        A = build_incidence_matrix(n, p)
+        src_rows = [i for i, nd in enumerate(n) if nd.is_source()]
+        total_supply = float(np.sum(A[src_rows, :] @ r.Q)) * 3600
+        assert abs(total_supply - total_demand) < 0.5, \
+            f"Supply {total_supply:.3f} ≠ demand {total_demand:.3f} Sm³/h"
+
+    def test_source_pressures_fixed(self):
+        n, p, g = self._setup()
+        r = solve_network(n, p, g, tol=1e-7, verbose=False)
+        assert abs(r.P_all[0] - (400e3+P_STD)) < 1.0
+        assert abs(r.P_all[8] - (375e3+P_STD)) < 1.0
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v', '--tb=short'])
+
+"""
+validate.py — Pre-solve network validation (mirrors the Excel VALIDATION sheet).
+"""
+import math
+from typing import List, Tuple, Dict
+from network import Node, Pipe, check_connectivity, straight_line_distance
+
+
+def validate_network(nodes: List[Node], pipes: List[Pipe],
+                     verbose: bool = True) -> Tuple[bool, List[str]]:
+    errors, warnings = [], []
+    node_map = {n.id: n for n in nodes}
+
+    def err(msg):  errors.append(f"[FAIL] {msg}")
+    def warn(msg): warnings.append(f"[!]   {msg}")
+
+    # Guard: empty inputs
+    if not nodes:
+        err("NODES sheet is empty — no nodes were read")
+    if not pipes:
+        err("PIPES sheet is empty — no pipes were read")
+    if not nodes or not pipes:
+        if verbose:
+            print(f"\n{'='*60}\n  PRE-SOLVE VALIDATION\n{'='*60}")
+            for e in errors: print(f"  {e}")
+            print(f"{'='*60}\n")
+        return False, errors
+
+    sources  = [n for n in nodes if n.is_source()]
+    offtakes = [n for n in nodes if n.is_offtake()]
+
+    # V01 At least one source
+    if not sources:
+        err("No source nodes — add at least one PRS/PRV as source")
+
+    # V02 At least one offtake
+    if not offtakes:
+        err("No offtake nodes — add at least one demand node")
+
+    # V03 Sources have known pressure
+    for n in sources:
+        if n.pressure <= 101_325.0:
+            err(f"Source {n.id} ({n.label}): pressure <= atmospheric — "
+                f"Known_P_kPa_g must be a positive number (e.g. 400). "
+                f"Check the cell contains a plain value, not a formula or text.")
+
+    # V04 Sources have no demand
+    for n in sources:
+        if abs(n.demand) > 1e-12:
+            err(f"Source {n.id} ({n.label}) has demand "
+                f"{n.demand*3600:.1f} Sm3/h -- sources supply, not consume")
+
+    # V05 Offtakes have positive demand
+    for n in offtakes:
+        if n.demand <= 0:
+            err(f"Offtake {n.id} ({n.label}) has zero/negative demand")
+
+    # V06 All pipe nodes exist
+    for pipe in pipes:
+        if pipe.from_node not in node_map:
+            err(f"Pipe {pipe.id}: From_Node '{pipe.from_node}' not in NODES")
+        if pipe.to_node not in node_map:
+            err(f"Pipe {pipe.id}: To_Node '{pipe.to_node}' not in NODES")
+
+    # V07 No self-loops
+    for pipe in pipes:
+        if pipe.from_node == pipe.to_node:
+            err(f"Pipe {pipe.id}: From_Node == To_Node (self-loop)")
+
+    # V08 No duplicate pipe pairs  ← must contain word "duplicate"
+    seen: Dict[tuple, str] = {}
+    for pipe in pipes:
+        key = tuple(sorted([pipe.from_node, pipe.to_node]))
+        if key in seen:
+            err(f"Duplicate pipe pair: {seen[key]} and {pipe.id} both connect "
+                f"{pipe.from_node} <-> {pipe.to_node} -- delete one")
+        else:
+            seen[key] = pipe.id
+
+    # V09 Positive dimensions
+    for pipe in pipes:
+        if pipe.length   <= 0: err(f"Pipe {pipe.id}: length <= 0")
+        if pipe.diameter <= 0: err(f"Pipe {pipe.id}: diameter <= 0")
+        if pipe.roughness < 0: err(f"Pipe {pipe.id}: roughness < 0")
+
+    # V10 Length ≥ straight-line distance
+    for pipe in pipes:
+        if pipe.from_node not in node_map or pipe.to_node not in node_map:
+            continue
+        nf, nt = node_map[pipe.from_node], node_map[pipe.to_node]
+        if nf.x_coord == 0 and nf.y_coord == 0:
+            continue
+        sl = straight_line_distance(nf, nt)
+        if sl > 1.0:
+            if pipe.length < sl - 0.5:
+                err(f"Pipe {pipe.id}: length {pipe.length:.0f} m < "
+                    f"straight-line {sl:.0f} m -- physically impossible")
+            elif pipe.length / sl > 2.5:
+                warn(f"Pipe {pipe.id}: route factor "
+                     f"{pipe.length/sl:.1f}x -- verify as-built")
+
+    # V11 Collinearity check
+    for pipe in pipes:
+        if pipe.from_node not in node_map or pipe.to_node not in node_map:
+            continue
+        nf, nt = node_map[pipe.from_node], node_map[pipe.to_node]
+        dx, dy = nt.x_coord-nf.x_coord, nt.y_coord-nf.y_coord
+        for nid, n in node_map.items():
+            if nid in [pipe.from_node, pipe.to_node]: continue
+            cross = dx*(n.y_coord-nf.y_coord) - dy*(n.x_coord-nf.x_coord)
+            if abs(cross) < 1.0 and (dx != 0 or dy != 0):
+                denom = dx if dx != 0 else dy
+                num   = (n.x_coord-nf.x_coord) if dx != 0 else (n.y_coord-nf.y_coord)
+                t = num/denom if denom else 0.5
+                if 0.01 < t < 0.99:
+                    err(f"Node {n.id} ({n.label}) lies ON pipe {pipe.id} "
+                        f"({nf.label}->{nt.label}) -- split the pipe at {n.label}")
+
+    # V12 Connectivity (skip if pipe nodes are broken — check_connectivity is safe now)
+    conn = check_connectivity(nodes, pipes)
+    if not conn['connected']:
+        for nid in conn['isolated']:
+            n = node_map[nid]
+            err(f"Node {nid} ({n.label}) not reachable from any source")
+
+    # V13 Total demand > 0
+    tot_demand = sum(n.demand for n in offtakes)
+    if tot_demand <= 0:
+        err("Total network demand is zero")
+
+    # V14 Min pressure feasibility
+    if sources:
+        max_src_p = max(n.pressure for n in sources)
+        for n in offtakes:
+            if n.min_pressure > max_src_p:
+                warn(f"Node {n.id} min pressure "
+                     f"({(n.min_pressure-101325)/1e3:.1f} kPa(g)) "
+                     f"exceeds max source pressure "
+                     f"({(max_src_p-101325)/1e3:.1f} kPa(g))")
+
+    # V15 GIS coordinates present (needed for geometric checks)
+    all_zero = all(n.x_coord == 0.0 and n.y_coord == 0.0 for n in nodes)
+    if all_zero:
+        warn("All node X_Coord/Y_Coord are zero — pipe length geometry checks skipped. "
+             "Add coordinates to enable V10 (length vs straight-line) validation.")
+
+    passed = len(errors) == 0
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"  PRE-SOLVE VALIDATION")
+        print(f"{'='*60}")
+        if passed:
+            print(f"  [OK] ALL CHECKS PASSED -- safe to run solver")
+        else:
+            print(f"  [FAIL] {len(errors)} error(s) -- fix before running solver")
+        if warnings:
+            print(f"  [!] {len(warnings)} warning(s)")
+        for e in errors:   print(f"  {e}")
+        for w in warnings: print(f"  {w}")
+        tot_h = tot_demand * 3600 if offtakes else 0
+        print(f"\n  Network: {len(nodes)} nodes | {len(pipes)} pipes")
+        print(f"  Total effective demand: {tot_h:.1f} Sm3/h")
+        print(f"{'='*60}\n")
+
+    return passed, errors + warnings
+
+"""
+gas_properties.py  — Z-factor (Papay), density, viscosity (Lee-Kesler).
+All SI units.  T in K internally; Lee-Kesler converted to Rankine internally.
+"""
+import math
+from dataclasses import dataclass
+
+P_STD       = 101_325.0   # Pa(a)
+T_STD       = 288.75      # K  (15.6 °C)
+R_UNIVERSAL = 8.314       # J/(mol·K)
+
+
+@dataclass
+class GasProperties:
+    P_abs: float; T: float; Z: float
+    rho:   float; mu: float; MW: float; SG: float
+
+
+def z_papay(P_abs: float, T: float, SG: float = 0.62) -> float:
+    """Papay (1968) Z-factor.  Ppc in psia → converted to Pa."""
+    Tpc = 93.3 + 180.6 * SG
+    Ppc = (677.0 + 15.0 * SG) * 6894.76   # psia → Pa  ← BUG FIX
+    Tr  = T    / Tpc
+    Pr  = P_abs / Ppc
+    Z   = (1.0
+           - (3.52 * Pr)    / (10 ** (0.9813 * Tr))
+           + (0.274 * Pr**2) / (10 ** (0.8157 * Tr)))
+    return max(Z, 0.5)
+
+
+def gas_density(P_abs: float, T: float,
+                SG: float = 0.62, Z: float = None) -> float:
+    MW_air = 0.028964
+    MW     = SG * MW_air
+    if Z is None:
+        Z = z_papay(P_abs, T, SG)
+    return (P_abs * MW) / (Z * R_UNIVERSAL * T)
+
+
+def gas_viscosity_lee_kesler(rho: float, T: float,
+                              MW_g_mol: float = 17.5) -> float:
+    """Lee & Kesler (1975).  T must be in Rankine (K × 1.8).  ← BUG FIX"""
+    T_R     = T * 1.8                # K → °R
+    rho_gcc = rho / 1000.0           # kg/m³ → g/cm³
+    K  = (9.4 + 0.02*MW_g_mol) * T_R**1.5 / (209.0 + 19.0*MW_g_mol + T_R)
+    X  = 3.5 + 986.0/T_R + 0.01*MW_g_mol
+    Y  = 2.4 - 0.2*X
+    mu_cp = 1e-4 * K * math.exp(X * rho_gcc**Y)
+    return mu_cp * 1e-3   # Pa·s
+
+
+def compute_gas_properties(P_abs: float, T: float,
+                            SG: float = 0.62,
+                            MW_g_mol: float = None) -> GasProperties:
+    if MW_g_mol is None:
+        MW_g_mol = SG * 28.964
+    Z   = z_papay(P_abs, T, SG)
+    rho = gas_density(P_abs, T, SG, Z)
+    mu  = gas_viscosity_lee_kesler(rho, T, MW_g_mol)
+    return GasProperties(P_abs=P_abs, T=T, Z=Z, rho=rho,
+                         mu=mu, MW=MW_g_mol*1e-3, SG=SG)
+
+
+def sm3s_to_m3s(Q, P_abs, T, Z, P_std=P_STD, T_std=T_STD):
+    return Q * (P_std/P_abs) * (T/T_std) * Z
+
+def m3s_to_sm3s(Q, P_abs, T, Z, P_std=P_STD, T_std=T_STD):
+    return Q * (P_abs/P_std) * (T_std/T) / Z
+
+"""
+hydraulics.py — Pipe conductance, flow equation, friction factor (Swamee-Jain).
+
+Flow equation (P² quadratic form — mandatory above 75 mbar gauge):
+    Q_j [Sm³/s] = K_j × sign(Φ_from - Φ_to) × sqrt(|Φ_from - Φ_to|)
+    where Φ_i = P_i²  (node potential [Pa²])
+
+Pipe conductance (derived from Darcy-Weisbach + ideal-gas continuity):
+    K_j = A_j × T_std/P_std × sqrt(D_j × R / (Z × T × f_j × L_j × MW))
+
+This form is P_avg-independent — K is a function of pipe geometry and
+gas state only, not of the local average pressure.
+
+All units SI (Pa, m, Sm³/s, kg/m³, Pa·s).
+"""
+
+import math
+import numpy as np
+from typing import List
+
+from network        import Node, Pipe
+from gas_properties import GasProperties, P_STD, T_STD, R_UNIVERSAL
+
+EPS_PHI = 1e4    # Pa²  — Jacobian regularisation (≈ 0.05 Pa diff at 4 bar)
+EPS_RE  = 1.0    # minimum Reynolds number
+EPS_Q   = 1e-12  # Sm³/s — near-zero flow floor
+
+
+def swamee_jain(Re: float, roughness: float, diameter: float) -> float:
+    """
+    Swamee-Jain (1976) explicit friction factor.
+
+    Laminar:    f = 64/Re          (Re < 2300)
+    Turbulent:  f = 0.25/[log10(ε/3.7D + 5.74/Re^0.9)]²
+    Transition: linear interpolation 2300–4000
+    """
+    Re = max(Re, EPS_RE)
+    if Re < 2300:
+        return 64.0 / Re
+    eps_D  = roughness / diameter
+    f_turb = 0.25 / (math.log10(eps_D / 3.7 + 5.74 / Re**0.9))**2
+    if Re >= 4000:
+        return f_turb
+    f_lam = 64.0 / 2300.0
+    alpha  = (Re - 2300.0) / 1700.0
+    return f_lam + alpha * (f_turb - f_lam)
+
+
+def compute_reynolds(Q_sm3s: float, pipe: Pipe,
+                     gas: GasProperties) -> float:
+    """Reynolds number using actual velocity at flowing conditions."""
+    Q_abs = abs(Q_sm3s)
+    if Q_abs < EPS_Q:
+        return EPS_RE
+    from gas_properties import sm3s_to_m3s
+    Q_act = sm3s_to_m3s(Q_abs, gas.P_abs, gas.T, gas.Z)
+    v     = Q_act / pipe.area
+    return max(gas.rho * v * pipe.diameter / gas.mu, EPS_RE)
+
+
+def compute_pipe_conductance(pipe: Pipe, f: float,
+                              gas: GasProperties) -> float:
+    """
+    Pipe conductance K [Sm³/(s·Pa)] for the quadratic P² flow equation.
+
+    Derivation:
+        From Darcy-Weisbach with Q_act = Q_std × (P_std/P_avg) × (T/T_std) × Z:
+            ΔP = f L ρ (Q_std × factor)² / (2 D A²)
+        With ΔP ≈ (P₁²-P₂²)/(2P_avg) and ρ = P_avg MW/(Z R T):
+            P₁²-P₂² = f L Q_std² MW P_std² / (D A² Z R T × factor²)
+        where factor = P_std/P_avg × T/T_std × Z cancels P_avg, giving:
+            K = A T_std/P_std × sqrt(D R / (Z T f L MW))  ← P_avg independent
+    """
+    if f < 1e-9:
+        f = 0.02
+    MW = gas.MW   # kg/mol
+    term = pipe.diameter * R_UNIVERSAL / (gas.Z * gas.T * f * pipe.length * MW)
+    return pipe.area * (T_STD / P_STD) * math.sqrt(max(term, 0.0))
+
+
+def compute_friction_factors(pipes: List[Pipe], flows: np.ndarray,
+                              gas: GasProperties) -> np.ndarray:
+    return np.array([swamee_jain(compute_reynolds(flows[j], p, gas),
+                                 p.roughness, p.diameter)
+                     for j, p in enumerate(pipes)])
+
+
+def delta_phi(Phi_all: np.ndarray, A: np.ndarray) -> np.ndarray:
+    """ΔΦ_j = Φ_from - Φ_to = (A^T @ Φ)_j  where Φ_i = P_i²"""
+    return A.T @ Phi_all
+
+
+def compute_flows_phi(dphi: np.ndarray, K: np.ndarray) -> np.ndarray:
+    """Q_j = sign(ΔΦ_j) × K_j × |ΔΦ_j|^0.5"""
+    return np.sign(dphi) * K * np.sqrt(np.abs(dphi))
+
+
+def compute_residual(Q: np.ndarray, A_u: np.ndarray,
+                     D_u: np.ndarray) -> np.ndarray:
+    """F_i = (A_u @ Q)_i - D_u_i  →  0 at convergence"""
+    return A_u @ Q + D_u
+
+
+def compute_jacobian_phi(A_u: np.ndarray, K: np.ndarray,
+                          dphi: np.ndarray) -> np.ndarray:
+    """
+    Jacobian of F w.r.t. Φ_unknown.
+    J = A_u @ diag(W) @ A_u^T   where W_jj = 0.5 K_j / (|ΔΦ_j|^0.5 + ε)
+    Symmetric and positive definite for a connected network.
+    """
+    W_diag = 0.5 * K / (np.sqrt(np.abs(dphi)) + EPS_PHI)
+    return A_u @ np.diag(W_diag) @ A_u.T
+
+
+def erosional_velocity(P_abs: float, gas: GasProperties) -> float:
+    """API RP 14E erosional velocity C/sqrt(ρ), C=122 SI."""
+    return 122.0 / math.sqrt(max(gas.rho, 0.1))
+
+"""
+io_excel.py
+-----------
+Read network data from the PE80 Excel template and write solver results back.
+
+Expected sheet names:  NODES, PIPES
+Output sheet name:     RESULTS
+
+All unit conversions happen here — the rest of the solver works in pure SI.
+"""
+
+import pandas as pd
+import numpy as np
+from openpyxl import load_workbook
+from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
+                              PatternFill)
+from openpyxl.utils import get_column_letter
+from typing import List, Tuple, Optional
+import logging
+
+from network import Node, Pipe
+from gas_properties import P_STD, T_STD
+
+log = logging.getLogger(__name__)
+
+# ── Unit conversion constants ─────────────────────────────────────────────────
+KPA_TO_PA    = 1_000.0
+SM3H_TO_SM3S = 1.0 / 3600.0
+MM_TO_M      = 1.0 / 1_000.0
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _check_sheets(filepath: str, required: list) -> None:
+    """Raise a clear ValueError if any required sheet is missing."""
+    wb = load_workbook(filepath, read_only=True)
+    found = wb.sheetnames
+    wb.close()
+    missing = [s for s in required if s not in found]
+    if missing:
+        raise ValueError(
+            f"Required sheet(s) not found in '{filepath}': {missing}\n"
+            f"Sheets present: {found}"
+        )
+
+
+def _find_header_row(filepath: str, sheet: str, id_col: str) -> int:
+    """Scan rows to find the one containing id_col — handles any number of title rows."""
+    df_raw = pd.read_excel(filepath, sheet_name=sheet, header=None, dtype=str)
+    for i, row in df_raw.iterrows():
+        if any(str(v).strip() == id_col for v in row.values):
+            return int(i)
+    raise ValueError(
+        f"Cannot find a row with column '{id_col}' in sheet '{sheet}'. "
+        f"Check that the column header is spelled exactly as '{id_col}'."
+    )
+
+
+def _require_cols(df: pd.DataFrame, required: list, sheet: str) -> None:
+    """Raise a clear ValueError listing every missing required column."""
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Sheet '{sheet}': missing required column(s): {missing}\n"
+            f"Columns found: {list(df.columns)}"
+        )
+
+
+def _safe_float(val, default, label: str = '') -> float:
+    """Convert val to float; return default (and warn) on non-numeric input."""
+    if pd.isna(val) if not isinstance(val, str) else (val.strip() == '' or val.strip().lower() == 'nan'):
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        if label:
+            log.warning(f"Non-numeric value in '{label}': {val!r} — using {default}")
+        return default
+
+
+def read_nodes(filepath: str,
+               sheet: str = 'NODES',
+               p_init_unknown: Optional[float] = None) -> List[Node]:
+    """
+    Read the NODES sheet from the PE80 Excel template.
+
+    Required columns: Node_ID, Node_Type
+    Optional columns: Name, Elevation_m, Known_P_kPa_g, Demand_Sm3h,
+                      Diversity_Factor (or Div_Factor), Eff_Demand_Sm3h,
+                      Min_P_kPa_g, X_Coord, Y_Coord
+    """
+    _check_sheets(filepath, [sheet])
+
+    hdr = _find_header_row(filepath, sheet, 'Node_ID')
+    df  = pd.read_excel(filepath, sheet_name=sheet, header=hdr)
+    df.columns = df.columns.str.strip()
+
+    _require_cols(df, ['Node_ID', 'Node_Type'], sheet)
+
+    # Drop blank rows
+    df = df[df['Node_ID'].astype(str).str.strip().str.len() > 0]
+    df = df.dropna(subset=['Node_ID'])
+    df = df[~df['Node_ID'].astype(str).str.strip().str.lower().isin(['nan', 'none', ''])]
+
+    # Duplicate Node_ID check
+    ids = df['Node_ID'].astype(str).str.strip()
+    dupes = ids[ids.duplicated()].unique().tolist()
+    if dupes:
+        raise ValueError(f"Duplicate Node_ID(s) in sheet '{sheet}': {dupes}")
+
+    # Accept both 'Diversity_Factor' and 'Div_Factor' column names
+    if 'Diversity_Factor' not in df.columns and 'Div_Factor' in df.columns:
+        df = df.rename(columns={'Div_Factor': 'Diversity_Factor'})
+
+    VALID_TYPES = {'source', 'junction', 'offtake'}
+
+    nodes = []
+    for _, row in df.iterrows():
+        nid   = str(row['Node_ID']).strip()
+        ntype = str(row['Node_Type']).strip().lower()
+        if ntype not in VALID_TYPES:
+            log.warning(f"Node {nid}: unrecognised type '{ntype}' — treated as junction")
+            ntype = 'junction'
+
+        name_val  = row.get('Name', None)
+        label     = str(name_val).strip() if pd.notna(name_val) else nid
+        elevation = _safe_float(row.get('Elevation_m'), 0.0, f"Node {nid} Elevation_m")
+        x_coord   = _safe_float(row.get('X_Coord'),    0.0, f"Node {nid} X_Coord")
+        y_coord   = _safe_float(row.get('Y_Coord'),    0.0, f"Node {nid} Y_Coord")
+
+        # Pressure — sources only
+        if ntype == 'source':
+            raw_p = row.get('Known_P_kPa_g', None)
+            p_val = _safe_float(raw_p, None, f"Node {nid} Known_P_kPa_g")
+            if p_val is None or p_val <= 0:
+                raise ValueError(
+                    f"Node {nid} (source): Known_P_kPa_g must be a positive number, "
+                    f"got {raw_p!r}. Check the cell contains a plain number, not a formula."
+                )
+            pressure = p_val * KPA_TO_PA + P_STD
+        else:
+            pressure = 0.0
+
+        # Demand — prefer Eff_Demand, fall back to Demand × DF
+        if ntype == 'offtake':
+            eff_dem = _safe_float(row.get('Eff_Demand_Sm3h'), None, f"Node {nid} Eff_Demand_Sm3h")
+            if eff_dem is not None:
+                demand = eff_dem * SM3H_TO_SM3S
+            else:
+                raw_dem = _safe_float(row.get('Demand_Sm3h'), None, f"Node {nid} Demand_Sm3h")
+                if 'Diversity_Factor' in df.columns:
+                    div_fac = _safe_float(row.get('Diversity_Factor'), 1.0, f"Node {nid} Diversity_Factor")
+                else:
+                    log.warning(f"Node {nid}: Diversity_Factor column missing — factor set to 1.0")
+                    div_fac = 1.0
+                demand = (raw_dem * div_fac * SM3H_TO_SM3S) if raw_dem is not None else 0.0
+        else:
+            demand = 0.0
+
+        # Minimum pressure
+        min_p_val = _safe_float(row.get('Min_P_kPa_g'), None, f"Node {nid} Min_P_kPa_g")
+        min_pressure = (min_p_val * KPA_TO_PA + P_STD) if (min_p_val is not None and min_p_val > 0) else P_STD
+
+        nodes.append(Node(
+            id=nid, label=label, node_type=ntype,
+            elevation=elevation, pressure=pressure, demand=demand,
+            min_pressure=min_pressure,
+            x_coord=x_coord, y_coord=y_coord,
+        ))
+
+    source_pressures = [n.pressure for n in nodes if n.is_source()]
+    if not source_pressures:
+        raise ValueError(
+            f"No source nodes found in sheet '{sheet}'. "
+            "Add at least one row with Node_Type='source' and a Known_P_kPa_g value."
+        )
+
+    p_init = p_init_unknown if p_init_unknown else min(source_pressures)
+    for n in nodes:
+        if not n.is_source():
+            n.pressure = p_init
+
+    log.info(f"Read {len(nodes)} nodes from '{sheet}' "
+             f"({sum(1 for n in nodes if n.is_source())} sources, "
+             f"{sum(1 for n in nodes if n.is_offtake())} offtakes, "
+             f"{sum(1 for n in nodes if n.is_junction())} junctions)")
+    return nodes
+
+
+def read_pipes(filepath: str,
+               sheet: str = 'PIPES',
+               status_filter: str = 'open') -> List[Pipe]:
+    """
+    Read the PIPES sheet from the PE80 Excel template.
+
+    Required columns: Pipe_ID, From_Node, To_Node
+    Length   : Length_m  →  Length_m_SI  (first non-null wins)
+    Diameter : ID_m_SI   →  ID_mm        →  OD_mm + SDR  (first available wins)
+    Roughness: Rough_m_SI → Roughness_mm → PE80 default 0.007 mm
+    """
+    _check_sheets(filepath, [sheet])
+
+    hdr = _find_header_row(filepath, sheet, 'Pipe_ID')
+    df  = pd.read_excel(filepath, sheet_name=sheet, header=hdr)
+    df.columns = df.columns.str.strip()
+
+    _require_cols(df, ['Pipe_ID', 'From_Node', 'To_Node'], sheet)
+
+    # Drop blank rows
+    df = df[df['Pipe_ID'].astype(str).str.strip().str.len() > 0]
+    df = df.dropna(subset=['Pipe_ID'])
+    df = df[~df['Pipe_ID'].astype(str).str.strip().str.lower().isin(['nan', 'none', ''])]
+
+    # Duplicate Pipe_ID check
+    pids = df['Pipe_ID'].astype(str).str.strip()
+    dupes = pids[pids.duplicated()].unique().tolist()
+    if dupes:
+        raise ValueError(f"Duplicate Pipe_ID(s) in sheet '{sheet}': {dupes}")
+
+    # Normalise Status: strip whitespace + lowercase before filtering
+    if 'Status' in df.columns:
+        df['Status'] = df['Status'].astype(str).str.strip().str.lower()
+        df = df[df['Status'] == status_filter.lower()]
+
+    pipes = []
+    for _, row in df.iterrows():
+        pid       = str(row['Pipe_ID']).strip()
+        from_node = str(row['From_Node']).strip()
+        to_node   = str(row['To_Node']).strip()
+
+        # ── Length ───────────────────────────────────────────────────────────
+        length = None
+        for col in ('Length_m', 'Length_m_SI'):
+            if col in df.columns:
+                v = _safe_float(row.get(col), None, f"Pipe {pid} {col}")
+                if v is not None:
+                    if col != 'Length_m':
+                        log.debug(f"Pipe {pid}: length from fallback column '{col}'")
+                    length = v
+                    break
+        if length is None:
+            raise ValueError(f"Pipe {pid}: no valid length found (checked Length_m, Length_m_SI).")
+        if length <= 0:
+            raise ValueError(f"Pipe {pid}: length must be > 0, got {length} m.")
+
+        # ── Diameter ─────────────────────────────────────────────────────────
+        diameter = None
+        if 'ID_m_SI' in df.columns:
+            diameter = _safe_float(row.get('ID_m_SI'), None, f"Pipe {pid} ID_m_SI")
+        if diameter is None and 'ID_mm' in df.columns:
+            v = _safe_float(row.get('ID_mm'), None, f"Pipe {pid} ID_mm")
+            if v is not None:
+                diameter = v * MM_TO_M
+        if diameter is None and 'OD_mm' in df.columns and 'SDR' in df.columns:
+            od  = _safe_float(row.get('OD_mm'), None, f"Pipe {pid} OD_mm")
+            sdr = _safe_float(row.get('SDR'),   None, f"Pipe {pid} SDR")
+            if od is not None and sdr is not None:
+                if sdr <= 2.0:
+                    raise ValueError(
+                        f"Pipe {pid}: SDR={sdr} is invalid (must be > 2). "
+                        "Check the SDR cell — it may contain a formula or wrong value."
+                    )
+                diameter = od * (1.0 - 2.0 / sdr) * MM_TO_M
+                log.debug(f"Pipe {pid}: diameter from OD/SDR = {od}mm / SDR{sdr} → {diameter*1000:.3f}mm ID")
+        if diameter is None:
+            raise ValueError(
+                f"Pipe {pid}: no valid diameter found. "
+                "Provide one of: ID_m_SI, ID_mm, or OD_mm + SDR columns."
+            )
+        if diameter <= 0:
+            raise ValueError(f"Pipe {pid}: computed diameter ≤ 0 ({diameter:.6f} m) — check OD_mm and SDR.")
+
+        # ── Roughness ────────────────────────────────────────────────────────
+        roughness = None
+        if 'Rough_m_SI' in df.columns:
+            roughness = _safe_float(row.get('Rough_m_SI'), None, f"Pipe {pid} Rough_m_SI")
+        if roughness is None and 'Roughness_mm' in df.columns:
+            v = _safe_float(row.get('Roughness_mm'), None, f"Pipe {pid} Roughness_mm")
+            if v is not None:
+                roughness = v * MM_TO_M
+        if roughness is None:
+            roughness = 7e-6  # PE80 default
+            log.debug(f"Pipe {pid}: roughness not found — using PE80 default (0.007 mm)")
+        if roughness < 0:
+            raise ValueError(f"Pipe {pid}: roughness must be ≥ 0, got {roughness} m.")
+
+        status = str(row.get('Status', 'open')).strip().lower()
+
+        pipes.append(Pipe(
+            id=pid, from_node=from_node, to_node=to_node,
+            length=length, diameter=diameter,
+            roughness=roughness, status=status,
+        ))
+
+    log.info(f"Read {len(pipes)} '{status_filter}' pipes from '{sheet}'")
+    return pipes
+
+
+def write_results(filepath: str,
+                  nodes: List[Node],
+                  pipes: List[Pipe],
+                  result,   # SolverResult
+                  gas,      # GasProperties
+                  sheet: str = 'RESULTS') -> None:
+    """
+    Write solver results to a new sheet in the Excel workbook.
+
+    Creates two tables:
+        1. Node results  — nodal pressures, pressure margins
+        2. Pipe results  — flows, velocities, Re, f, pressure gradient, loading
+
+    Parameters
+    ----------
+    filepath : str         path to the .xlsx file (modified in-place)
+    nodes    : list        Node objects (with solved pressures)
+    pipes    : list        Pipe objects (with computed flows)
+    result   : SolverResult
+    gas      : GasProperties
+    sheet    : str         output sheet name
+    """
+    from postprocess import compute_pipe_results, compute_node_results
+
+    pipe_df = compute_pipe_results(pipes, nodes, result, gas)
+    node_df = compute_node_results(nodes, result)
+
+    wb = load_workbook(filepath)
+
+    # Remove old RESULTS sheet if it exists
+    if sheet in wb.sheetnames:
+        del wb[sheet]
+
+    ws = wb.create_sheet(sheet)
+    ws.sheet_properties.tabColor = "375623"
+
+    # ── Colour palette ──
+    NAVY      = "1F4E79"
+    BLUE      = "2E75B6"
+    LIGHT_BLU = "D6E4F0"
+    GREEN_DK  = "375623"
+    LIGHT_GRN = "E2EFDA"
+    ORANGE    = "C55A11"
+    LIGHT_ORN = "FCE4D6"
+    RED       = "C00000"
+    LIGHT_RED = "FCE4D6"
+    WHITE     = "FFFFFF"
+    LGRAY     = "F2F2F2"
+    VLIGHT    = "EBF3FB"
+
+    s = Side(style="thin", color="CCCCCC")
+    bdr = Border(top=s, bottom=s, left=s, right=s)
+
+    def hdr_cell(ws, row, col, value, bg=NAVY, fg=WHITE, size=10):
+        c = ws.cell(row=row, column=col)
+        c.value = value
+        c.font = Font(name="Arial", bold=True, size=size, color=fg)
+        c.fill = PatternFill("solid", fgColor=bg)
+        c.alignment = Alignment(horizontal="center", vertical="center",
+                                wrap_text=True)
+        c.border = bdr
+        return c
+
+    def data_cell(ws, row, col, value, bg=WHITE, fg="2c2c2a",
+                  bold=False, fmt=None, align="center"):
+        c = ws.cell(row=row, column=col)
+        c.value = value
+        c.font = Font(name="Arial", size=10, color=fg, bold=bold)
+        c.fill = PatternFill("solid", fgColor=bg)
+        c.alignment = Alignment(horizontal=align, vertical="center")
+        c.border = bdr
+        if fmt:
+            c.number_format = fmt
+        return c
+
+    # ── Banner ────────────────────────────────────────────────────────────────
+    ws.merge_cells("A1:L1")
+    c = ws["A1"]
+    c.value = (f"PE80 GAS NETWORK — SOLVER RESULTS   |   "
+               f"{'CONVERGED' if result.converged else 'NOT CONVERGED'}   |   "
+               f"{result.iterations} iterations   |   "
+               f"max|F| = {result.final_residual:.3e} Sm³/s")
+    c.font = Font(name="Arial", bold=True, size=12, color=WHITE)
+    c.fill = PatternFill("solid", fgColor=GREEN_DK if result.converged else RED)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 24
+
+    # ── NODE RESULTS TABLE ────────────────────────────────────────────────────
+    ws.merge_cells("A3:G3")
+    c = ws["A3"]
+    c.value = "NODE RESULTS"
+    c.font = Font(name="Arial", bold=True, size=11, color=WHITE)
+    c.fill = PatternFill("solid", fgColor=BLUE)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[3].height = 20
+
+    node_headers = [
+        "Node_ID", "Label", "Type",
+        "Solved_P\n[kPa(g)]", "Min_P\n[kPa(g)]",
+        "Margin\n[kPa]", "Status"
+    ]
+    for j, h in enumerate(node_headers):
+        hdr_cell(ws, 4, j+1, h, bg=NAVY)
+    ws.row_dimensions[4].height = 32
+
+    for i, row in node_df.iterrows():
+        r = i + 5
+        bg = VLIGHT if i % 2 == 0 else WHITE
+        margin = row.get('Margin_kPa', 0)
+        status = row.get('Status', '✓')
+
+        data_cell(ws, r, 1, row['Node_ID'],   bg=bg, bold=True, fg=NAVY, align="left")
+        data_cell(ws, r, 2, row['Label'],      bg=bg, align="left")
+        data_cell(ws, r, 3, row['Type'],       bg=bg)
+        data_cell(ws, r, 4, row.get('P_kPag', 0),   bg=bg, fmt="#,##0.1")
+        data_cell(ws, r, 5, row.get('MinP_kPag', 0), bg=bg, fmt="#,##0.1")
+
+        # Margin — red if negative
+        m_bg = LIGHT_RED if margin < 0 else bg
+        m_fg = RED if margin < 0 else "2c2c2a"
+        data_cell(ws, r, 6, margin, bg=m_bg, fg=m_fg, fmt="#,##0.1")
+
+        s_bg = LIGHT_RED if '✗' in str(status) else LIGHT_GRN if '✓' in str(status) else bg
+        s_fg = RED if '✗' in str(status) else GREEN_DK if '✓' in str(status) else "2c2c2a"
+        data_cell(ws, r, 7, status, bg=s_bg, fg=s_fg, bold=True)
+        ws.row_dimensions[r].height = 18
+
+    # ── PIPE RESULTS TABLE ────────────────────────────────────────────────────
+    pipe_start_row = 5 + len(node_df) + 3
+
+    ws.merge_cells(f"A{pipe_start_row}:L{pipe_start_row}")
+    c = ws.cell(pipe_start_row, 1)
+    c.value = "PIPE RESULTS"
+    c.font = Font(name="Arial", bold=True, size=11, color=WHITE)
+    c.fill = PatternFill("solid", fgColor=ORANGE)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[pipe_start_row].height = 20
+
+    pipe_headers = [
+        "Pipe_ID", "From", "To",
+        "Q\n[Sm³/h]", "Direction",
+        "v\n[m/s]", "Re\n[-]",
+        "f\n[-]",
+        "ΔP\n[mbar]",
+        "Grad\n[mbar/m]",
+        "Loading\n[%]",
+        "Status"
+    ]
+    hdr_row = pipe_start_row + 1
+    for j, h in enumerate(pipe_headers):
+        hdr_cell(ws, hdr_row, j+1, h, bg=ORANGE)
+    ws.row_dimensions[hdr_row].height = 32
+
+    for i, row in pipe_df.iterrows():
+        r = hdr_row + 1 + i
+        bg = VLIGHT if i % 2 == 0 else WHITE
+        loading = row.get('Loading_pct', 0)
+        v       = row.get('v_ms', 0)
+        status  = row.get('Status', '✓')
+
+        # Loading colour: green < 70%, amber 70–90%, red > 90%
+        if loading > 90:
+            l_bg, l_fg = LIGHT_RED, RED
+        elif loading > 70:
+            l_bg, l_fg = "FFF2CC", "7F6000"
+        else:
+            l_bg, l_fg = LIGHT_GRN, GREEN_DK
+
+        data_cell(ws, r,  1, row['Pipe_ID'],       bg=bg, bold=True, fg=ORANGE, align="left")
+        data_cell(ws, r,  2, row['From'],           bg=bg, align="left")
+        data_cell(ws, r,  3, row['To'],             bg=bg, align="left")
+        data_cell(ws, r,  4, row.get('Q_sm3h', 0), bg=bg, fmt="#,##0.1")
+        data_cell(ws, r,  5, row.get('Direction','→'), bg=bg)
+        data_cell(ws, r,  6, v,                    bg=bg, fmt="0.00")
+        data_cell(ws, r,  7, row.get('Re', 0),     bg=bg, fmt="#,##0")
+        data_cell(ws, r,  8, row.get('f', 0),      bg=bg, fmt="0.00000")
+        data_cell(ws, r,  9, row.get('dP_mbar', 0), bg=bg, fmt="#,##0.1")
+        data_cell(ws, r, 10, row.get('Grad_mbar_m', 0), bg=bg, fmt="0.000")
+        data_cell(ws, r, 11, loading,              bg=l_bg, fg=l_fg, fmt="0.0")
+        data_cell(ws, r, 12, status,               bg=bg)
+        ws.row_dimensions[r].height = 18
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    col_widths = [10, 16, 16, 12, 10, 10, 12, 10, 12, 12, 10, 14]
+    for j, w in enumerate(col_widths):
+        ws.column_dimensions[get_column_letter(j+1)].width = w
+
+    # ── Mass balance summary ──────────────────────────────────────────────────
+    mb_row = hdr_row + 1 + len(pipe_df) + 2
+    from network import build_incidence_matrix
+    import numpy as np
+    _A       = build_incidence_matrix(nodes, pipes)
+    _src_idx = [i for i, n in enumerate(nodes) if n.is_source()]
+    _Q       = np.array([p.flow for p in pipes])
+    total_supply = float(np.sum(_A[_src_idx, :] @ _Q)) * 3600
+    total_demand = sum(n.demand * 3600 for n in nodes if n.is_offtake())
+    balance      = total_supply - total_demand
+
+    ws.merge_cells(f"A{mb_row}:D{mb_row}")
+    ws.cell(mb_row, 1).value = "MASS BALANCE"
+    ws.cell(mb_row, 1).font  = Font(name="Arial", bold=True, size=10, color=WHITE)
+    ws.cell(mb_row, 1).fill  = PatternFill("solid", fgColor=NAVY)
+    ws.cell(mb_row, 1).alignment = Alignment(horizontal="center")
+
+    for label, value, col in [
+        ("Total supply [Sm³/h]",  total_supply, 5),
+        ("Total demand [Sm³/h]",  total_demand, 7),
+        ("Balance [Sm³/h]",       balance,      9),
+    ]:
+        ws.cell(mb_row, col).value = label
+        ws.cell(mb_row, col).font  = Font(name="Arial", bold=True, size=10)
+        ws.cell(mb_row, col+1).value = round(value, 3)
+        ws.cell(mb_row, col+1).font  = Font(name="Arial", size=10,
+                                             color=RED if abs(balance) > 0.1 else GREEN_DK)
+
+    wb.save(filepath)
+    log.info(f"Results written to sheet '{sheet}' in {filepath}")
